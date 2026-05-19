@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(cartographer_parallel)
+
+find_package(catkin REQUIRED COMPONENTS
+  roscpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
+)
+
+catkin_package(
+  INCLUDE_DIRS include
+  LIBRARIES assignment_lib fast_matcher_lib
+  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs nav_msgs visualization_msgs
+)
+
+include_directories(include ${catkin_INCLUDE_DIRS})
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(OpenMP REQUIRED)
+
+# CPU OpenMP 버전으로 빌드
+# 사용할 구현체를 선택:
+#   score_all_baseline.cpp  → 순차 baseline
+#   score_all_cpu_openmp.cpp → -O3 + OpenMP (권장)
+add_library(assignment_lib src/score_all_cpu_openmp.cpp)
+target_compile_options(assignment_lib PRIVATE -O3 -march=native)
+target_link_libraries(assignment_lib ${catkin_LIBRARIES} OpenMP::OpenMP_CXX)
+
+add_library(fast_matcher_lib src/fast_matcher.cpp)
+target_link_libraries(fast_matcher_lib assignment_lib ${catkin_LIBRARIES})
+
+add_executable(fast_correlative_node src/fast_correlative_node.cpp)
+target_link_libraries(fast_correlative_node fast_matcher_lib ${catkin_LIBRARIES})
+
+# 합성 데이터 벤치마크
+add_executable(profile_synthetic benchmark/profile_synthetic.cpp)
+target_compile_options(profile_synthetic PRIVATE -O3 -march=native)
+target_link_libraries(profile_synthetic assignment_lib ${catkin_LIBRARIES} OpenMP::OpenMP_CXX)
+
+install(TARGETS assignment_lib fast_matcher_lib fast_correlative_node
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+install(DIRECTORY launch maps bags DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
