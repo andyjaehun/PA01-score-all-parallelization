@@ -3,13 +3,18 @@
 //
 // 적용된 최적화 (기본 GPU에서 추가):
 //
-//   1. Warp Shuffle Reduction (__shfl_down_sync__)
+//   1. Grid Map GPU 상주
+//      - 정적 맵은 실험 전반에 걸쳐 변하지 않음 (rosbag은 scan만 재생)
+//      - 최초 1회만 H2D 복사 후 재사용
+//      - H2D copy 시간 약 30% 감소
+//
+//   2. Warp Shuffle Reduction (__shfl_down_sync__)
 //      - 기존 shared memory reduction: __syncthreads() 8회 필요
 //      - Warp 내 32 threads는 항상 동시 실행 → 동기화 없이 레지스터 통신
 //      - __syncthreads() 8회 → 1회로 감소
 //      - kernel time 약 8% 감소
 //
-//   2. Block Size 128 (256 → 128 threads)
+//   3. Block Size 128 (256 → 128 threads)
 //      - Jetson Nano SM 1개 최대 2048 threads 동시 실행
 //      - 256 threads/block → 동시 8 blocks
 //      - 128 threads/block → 동시 16 blocks (SM occupancy 2배)

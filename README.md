@@ -53,8 +53,9 @@ PA01_submission/
 - **`__ldg__()`**: read-only texture cache 활용으로 global memory 접근 비용 감소
 
 ### score_all_gpu_final.cpp
-기본 GPU에 2가지 최적화를 추가한 최종 버전입니다.
-- **Warp Shuffle Reduction**: `__shfl_down_sync__()` 사용, syncthreads 8회 → 1회, kernel time -8%
+기본 GPU에 3가지 최적화를 추가한 최종 버전입니다.
+- **Grid Map GPU 상주**: 정적 맵은 최초 1회만 H2D 복사, 이후 재사용 (H2D -30%)
+- **Warp Shuffle Reduction**: `__shfl_down_sync__()` 사용, syncthreads 8회 → 1회 (kernel -8%)
 - **Block Size 128**: 256 → 128 threads/block, SM 동시 block 수 2배 증가
 
 ---
