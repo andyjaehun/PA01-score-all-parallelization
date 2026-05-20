@@ -3,20 +3,17 @@
 //
 // 적용된 최적화 (기본 GPU에서 추가):
 //
-//   1. Grid Map GPU 상주
-//      - grid map은 프레임 간 변하지 않는 고정 데이터
-//      - 최초 1회만 GPU에 업로드하고 이후 재사용
-//      - H2D 복사량: 1MB grid 제거 → px/py/cx/cy (수 KB)만 전송
-//
-//   2. Warp Shuffle Reduction (__shfl_down_sync__)
+//   1. Warp Shuffle Reduction (__shfl_down_sync__)
 //      - 기존 shared memory reduction: __syncthreads() 8회 필요
 //      - Warp 내 32 threads는 항상 동시 실행 → 동기화 없이 레지스터 통신
 //      - __syncthreads() 8회 → 1회로 감소
+//      - kernel time 약 8% 감소
 //
-//   3. Block Size 128 (256 → 128 threads)
+//   2. Block Size 128 (256 → 128 threads)
 //      - Jetson Nano SM 1개 최대 2048 threads 동시 실행
 //      - 256 threads/block → 동시 8 blocks
 //      - 128 threads/block → 동시 16 blocks (SM occupancy 2배)
+//      - latency hiding 효과 향상
 
 #include "cartographer_parallel/assignment.h"
 #include <algorithm>
@@ -49,9 +46,9 @@ void cpu_fallback(const std::vector<unsigned char>& grid, const int w,
 
 #ifdef __CUDACC__
 
-// Warp Shuffle Reduction + Block 128
-// - 128 threads = 4 warps → shared memory 4 int (기존 256 int 대비 1/64)
-// - warp 내부는 __shfl_down_sync__으로 register 통신 (syncthreads 불필요)
+// Warp Shuffle Reduction + Block Size 128
+// - 128 threads = 4 warps
+// - warp 내부: __shfl_down_sync__으로 register 통신 (syncthreads 불필요)
 // - warp 간 합산에만 __syncthreads__ 1회 사용
 __global__ void score_all_kernel_final(
     const unsigned char* __restrict__ grid, const int w, const int h,
@@ -62,8 +59,8 @@ __global__ void score_all_kernel_final(
 
   const int cand = blockIdx.x;
   const int tid  = threadIdx.x;
-  const int lane = tid & 31;   // warp 내 위치
-  const int wid  = tid >> 5;   // warp 번호
+  const int lane = tid & 31;
+  const int wid  = tid >> 5;
 
   if (cand >= n) return;
 
@@ -85,7 +82,6 @@ __global__ void score_all_kernel_final(
   if (lane == 0) warp_sums[wid] = local_sum;
   __syncthreads();  // 딱 1번
 
-  // Warp 0이 4개 warp_sums 최종 합산
   if (wid == 0) {
     local_sum = (lane < (blockDim.x >> 5)) ? warp_sums[lane] : 0;
     for (int offset = 2; offset > 0; offset >>= 1)
@@ -96,18 +92,14 @@ __global__ void score_all_kernel_final(
     score[cand] = static_cast<float>(local_sum) / (255.0f * p);
 }
 
-// GpuWorkspace: device memory 재사용 + grid 상주
+// GpuWorkspace: device memory 재사용 (cudaMalloc overhead 제거)
 struct GpuWorkspace {
-  // Grid: 최초 1회만 업로드
-  unsigned char* d_grid     = nullptr; size_t d_grid_cap = 0;
-  bool           grid_ready = false;
-
-  // 나머지: 매 호출마다 업데이트
-  int*   d_px    = nullptr; size_t d_px_cap    = 0;
-  int*   d_py    = nullptr; size_t d_py_cap    = 0;
-  int*   d_cx    = nullptr; size_t d_cx_cap    = 0;
-  int*   d_cy    = nullptr; size_t d_cy_cap    = 0;
-  float* d_score = nullptr; size_t d_score_cap = 0;
+  unsigned char* grid  = nullptr; size_t grid_cap  = 0;
+  int*           px    = nullptr; size_t px_cap    = 0;
+  int*           py    = nullptr; size_t py_cap    = 0;
+  int*           cx    = nullptr; size_t cx_cap    = 0;
+  int*           cy    = nullptr; size_t cy_cap    = 0;
+  float*         score = nullptr; size_t score_cap = 0;
 };
 
 GpuWorkspace& get_workspace() {
@@ -159,41 +151,32 @@ void score_all(const std::vector<unsigned char>& grid, const int w,
 
     GpuWorkspace& g = get_workspace();
     bool ok = true;
-
-    // Grid 상주: 최초 1회만 H2D 복사
-    if (!g.grid_ready) {
-      ok = ok && grow(&g.d_grid, &g.d_grid_cap, gb);
-      if (ok) {
-        ok = ok && cudaMemcpy(g.d_grid, grid.data(), gb,
-                              cudaMemcpyHostToDevice) == cudaSuccess;
-        if (ok) g.grid_ready = true;
-      }
-    }
-
-    ok = ok && grow(&g.d_px,    &g.d_px_cap,    pb);
-    ok = ok && grow(&g.d_py,    &g.d_py_cap,    pb);
-    ok = ok && grow(&g.d_cx,    &g.d_cx_cap,    cb);
-    ok = ok && grow(&g.d_cy,    &g.d_cy_cap,    cb);
-    ok = ok && grow(&g.d_score, &g.d_score_cap, sb);
+    ok = ok && grow(&g.grid,  &g.grid_cap,  gb);
+    ok = ok && grow(&g.px,    &g.px_cap,    pb);
+    ok = ok && grow(&g.py,    &g.py_cap,    pb);
+    ok = ok && grow(&g.cx,    &g.cx_cap,    cb);
+    ok = ok && grow(&g.cy,    &g.cy_cap,    cb);
+    ok = ok && grow(&g.score, &g.score_cap, sb);
 
     if (ok) {
-      // H2D: px/py/cx/cy만 복사 (grid 제외)
-      ok = ok && cudaMemcpy(g.d_px, px.data(), pb, cudaMemcpyHostToDevice)==cudaSuccess;
-      ok = ok && cudaMemcpy(g.d_py, py.data(), pb, cudaMemcpyHostToDevice)==cudaSuccess;
-      ok = ok && cudaMemcpy(g.d_cx, cx.data(), cb, cudaMemcpyHostToDevice)==cudaSuccess;
-      ok = ok && cudaMemcpy(g.d_cy, cy.data(), cb, cudaMemcpyHostToDevice)==cudaSuccess;
+      // 매 호출마다 모든 데이터 H2D 복사 (SLAM 환경 대응)
+      ok = ok && cudaMemcpy(g.grid, grid.data(), gb, cudaMemcpyHostToDevice)==cudaSuccess;
+      ok = ok && cudaMemcpy(g.px,   px.data(),   pb, cudaMemcpyHostToDevice)==cudaSuccess;
+      ok = ok && cudaMemcpy(g.py,   py.data(),   pb, cudaMemcpyHostToDevice)==cudaSuccess;
+      ok = ok && cudaMemcpy(g.cx,   cx.data(),   cb, cudaMemcpyHostToDevice)==cudaSuccess;
+      ok = ok && cudaMemcpy(g.cy,   cy.data(),   cb, cudaMemcpyHostToDevice)==cudaSuccess;
 
       if (ok) {
-        constexpr int kTPB = 128;  // Block Size 128
-        const size_t shmem = (kTPB / 32) * sizeof(int);  // 4 warps × 4 bytes
+        constexpr int kTPB = 128;
+        const size_t shmem = (kTPB / 32) * sizeof(int);
         score_all_kernel_final<<<n, kTPB, shmem>>>(
-            g.d_grid, w, h, g.d_px, g.d_py, p,
-            g.d_cx, g.d_cy, n, g.d_score);
+            g.grid, w, h, g.px, g.py, p,
+            g.cx, g.cy, n, g.score);
         ok = cudaGetLastError() == cudaSuccess;
       }
 
       if (ok)
-        cudaMemcpy(score->data(), g.d_score, sb, cudaMemcpyDeviceToHost);
+        cudaMemcpy(score->data(), g.score, sb, cudaMemcpyDeviceToHost);
       return;
     }
   }
