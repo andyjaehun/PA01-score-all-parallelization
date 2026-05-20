@@ -92,10 +92,11 @@ __global__ void score_all_kernel_final(
     score[cand] = static_cast<float>(local_sum) / (255.0f * p);
 }
 
-// GpuWorkspace: device memory 재사용 (cudaMalloc overhead 제거)
+// GpuWorkspace: device memory 재사용 + grid 상주
 struct GpuWorkspace {
-  unsigned char* grid  = nullptr; size_t grid_cap  = 0;
-  int*           px    = nullptr; size_t px_cap    = 0;
+  unsigned char* grid     = nullptr; size_t grid_cap  = 0;
+  bool           grid_ready = false;
+  int*           px       = nullptr; size_t px_cap    = 0;
   int*           py    = nullptr; size_t py_cap    = 0;
   int*           cx    = nullptr; size_t cx_cap    = 0;
   int*           cy    = nullptr; size_t cy_cap    = 0;
@@ -151,7 +152,17 @@ void score_all(const std::vector<unsigned char>& grid, const int w,
 
     GpuWorkspace& g = get_workspace();
     bool ok = true;
-    ok = ok && grow(&g.grid,  &g.grid_cap,  gb);
+
+    // Grid 상주: 처음 한 번만 업로드 (정적 맵 환경)
+    if (!g.grid_ready) {
+      ok = ok && grow(&g.grid, &g.grid_cap, gb);
+      if (ok) {
+        ok = ok && cudaMemcpy(g.grid, grid.data(), gb,
+                              cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) g.grid_ready = true;
+      }
+    }
+
     ok = ok && grow(&g.px,    &g.px_cap,    pb);
     ok = ok && grow(&g.py,    &g.py_cap,    pb);
     ok = ok && grow(&g.cx,    &g.cx_cap,    cb);
@@ -159,8 +170,6 @@ void score_all(const std::vector<unsigned char>& grid, const int w,
     ok = ok && grow(&g.score, &g.score_cap, sb);
 
     if (ok) {
-      // 매 호출마다 모든 데이터 H2D 복사 (SLAM 환경 대응)
-      ok = ok && cudaMemcpy(g.grid, grid.data(), gb, cudaMemcpyHostToDevice)==cudaSuccess;
       ok = ok && cudaMemcpy(g.px,   px.data(),   pb, cudaMemcpyHostToDevice)==cudaSuccess;
       ok = ok && cudaMemcpy(g.py,   py.data(),   pb, cudaMemcpyHostToDevice)==cudaSuccess;
       ok = ok && cudaMemcpy(g.cx,   cx.data(),   cb, cudaMemcpyHostToDevice)==cudaSuccess;
